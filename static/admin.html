@@ -51,6 +51,7 @@ function render(t) {
   const srvOffset = t.now - Date.now();  // 倒计时以服务端时钟为准
   const remain = t.deadline - (Date.now() + srvOffset);
   const past = remain <= 0;
+  const frozen = !!(t.ended || t.settled);  // 提前结束或结算：名单/答卷入口均已冻结
   appEl.innerHTML = `
     <div class="card">
       <h2>测试 <span class="mono">${esc(t.test_code)}</span></h2>
@@ -58,6 +59,11 @@ function render(t) {
       <p class="small">截止时间：<b>${fmtTime(t.deadline)}</b>
         ｜ 最少有效答卷：<b>${t.min_valid}</b> 份</p>
       <p class="small">距截止：<b id="countdown" style="font-size:16px">${esc(fmtCountdown(remain))}</b></p>
+      ${t.ended ? `
+      <div class="callout no">
+        收集已于 ${fmtTime(t.ended_at)} 由负责人<b>提前结束</b>，名单与答卷入口已冻结。
+        结束原因：${esc(t.end_reason)}
+      </div>` : ''}
       <div class="stat-grid">
         <div class="stat"><div class="num">${t.progress.total}</div><div class="cap">评员总数</div></div>
         <div class="stat"><div class="num">${t.progress.submitted}</div><div class="cap">已提交(含弃权)</div></div>
@@ -65,12 +71,29 @@ function render(t) {
         <div class="stat"><div class="num">${t.withdrawn_count || 0}</div><div class="cap">已撤回</div></div>
       </div>
       <p class="hint">截止前仅显示汇总计数，不显示任何评员的答案与三杯对应关系，以防泄露。</p>
-      <button id="settleBtn" ${(!past || t.settled) ? 'disabled' : ''}>
-        ${t.settled ? '已结算（结果已冻结）' : past ? '立即结算' : '截止后才能结算'}
+      <button id="settleBtn" ${((!past && !t.ended) || t.settled) ? 'disabled' : ''}>
+        ${t.settled ? '已结算（结果已冻结）'
+          : (past || t.ended) ? '立即结算' : '到期或结束收集后才能结算'}
       </button>
       <div id="settleMsg"></div>
       <div id="report"></div>
     </div>
+
+    ${(!t.ended && !t.settled && !past) ? `
+    <div class="card">
+      <h2>提前结束收集（截止前 · 谨慎操作）</h2>
+      <p class="hint">
+        提交后<b>立即冻结名单与答卷入口</b>：评员再访问或提交都会收到“已结束”，
+        撤回 / 补位也将被拒绝；此操作<b>不可撤销</b>。结束后可立即在上方结算，
+        结算仍按已有有效答卷、最少有效答卷数与 p 值规则冻结结果。
+        未结束的实验保持原截止行为。
+      </p>
+      <label>结束原因（必填，1～200 字，将记入操作时间线）</label>
+      <textarea id="endReason" rows="3" maxlength="200"
+        placeholder="例如：有效答卷已达标，提前结算"></textarea>
+      <button id="endBtn" class="danger">提前结束收集</button>
+      <div id="endMsg"></div>
+    </div>` : ''}
 
     ${t.settled ? `
     <div class="card">
@@ -116,9 +139,11 @@ function render(t) {
         调整后有效人数须在 <b>${t.min_valid}</b> ～ <b>500</b> 人之间，
         任一校验失败则整次操作无效。
       </p>
-      ${(past || t.settled) ? `
+      ${(past || frozen) ? `
         <div class="callout ${t.settled ? 'no' : 'warn'}">
-          ${t.settled ? '测试已结算，名单已冻结，不能调整。' : '已过截止时间，不能调整名单。'}
+          ${t.settled ? '测试已结算，名单已冻结，不能调整。'
+            : t.ended ? '收集已提前结束，名单已冻结，不能调整。'
+            : '已过截止时间，不能调整名单。'}
         </div>` : `
         <label>要撤回的盲评码（每行一个；可留空表示只补位）</label>
         <textarea id="withdrawCodes" rows="3"
@@ -151,7 +176,8 @@ function render(t) {
     const el = document.getElementById('countdown');
     if (el) el.textContent = fmtCountdown(t.deadline - (Date.now() + srvOffset));
     const btn = document.getElementById('settleBtn');
-    if (btn && !t.settled && t.deadline - (Date.now() + srvOffset) <= 0 && btn.disabled) {
+    if (btn && !t.settled && !t.ended
+        && t.deadline - (Date.now() + srvOffset) <= 0 && btn.disabled) {
       btn.disabled = false;
       btn.textContent = '立即结算';
     }
@@ -160,6 +186,8 @@ function render(t) {
   document.getElementById('settleBtn').addEventListener('click', doSettle);
   const adjustBtn = document.getElementById('adjustBtn');
   if (adjustBtn) adjustBtn.addEventListener('click', doAdjust);
+  const endBtn = document.getElementById('endBtn');
+  if (endBtn) endBtn.addEventListener('click', doEnd);
   const shareBtn = document.getElementById('shareCreateBtn');
   if (shareBtn) shareBtn.addEventListener('click', doCreateShare);
   if (t.settled) doSettle();
@@ -260,6 +288,31 @@ async function doAdjust() {
   } catch (err) {
     showErr(msgEl, err.message);
     btn.disabled = false; btn.textContent = '执行调整';
+  }
+}
+
+async function doEnd() {
+  const msgEl = document.getElementById('endMsg');
+  const reason = document.getElementById('endReason').value.trim();
+  if (!reason) { showErr(msgEl, '请填写结束原因（1～200 字）。'); return; }
+  if (reason.length > 200) { showErr(msgEl, '结束原因不得超过 200 字。'); return; }
+  if (!confirm('确认提前结束收集？\n\n提交后名单与答卷入口立即冻结，'
+      + '评员将无法再访问或提交，撤回/补位也被拒绝，且此操作不可撤销。')) return;
+
+  const btn = document.getElementById('endBtn');
+  btn.disabled = true; btn.textContent = '结束中…';
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/end`, {
+      method: 'POST', body: { token, reason },
+    });
+    showInfo(msgEl,
+      (r.reused ? '该实验已处于结束状态（返回同一结束记录）：'
+                : '收集已提前结束，答卷入口已冻结。')
+      + `结束时间 ${fmtTime(r.ended_at)}。可立即结算。`, 'ok');
+    load();  // 刷新以展示结束横幅、启用结算并冻结名单调整
+  } catch (err) {
+    showErr(msgEl, err.message);
+    btn.disabled = false; btn.textContent = '提前结束收集';
   }
 }
 

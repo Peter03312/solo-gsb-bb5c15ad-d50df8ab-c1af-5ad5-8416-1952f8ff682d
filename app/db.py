@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS tests (
     min_valid          INTEGER NOT NULL,
     created_at         INTEGER NOT NULL,
     settled_at         INTEGER,
+    ended_at           INTEGER,                          -- 负责人提前结束收集时间（秒）；NULL 表示未提前结束
+    end_reason         TEXT,                             -- 提前结束原因（trim 后 1～200 字）
     valid_count        INTEGER,
     correct_count      INTEGER,
     p_value            REAL,
@@ -34,7 +36,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/settle/history_start/share_create/share_revoke
+    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
@@ -94,6 +96,12 @@ def init_db():
                 "ALTER TABLE assignments ADD COLUMN status TEXT NOT NULL "
                 "DEFAULT 'active'"
             )
+        # 兼容旧库：为已存在的 tests 表补提前结束相关列
+        tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tests)")}
+        if "ended_at" not in tcols:
+            conn.execute("ALTER TABLE tests ADD COLUMN ended_at INTEGER")
+        if "end_reason" not in tcols:
+            conn.execute("ALTER TABLE tests ADD COLUMN end_reason TEXT")
         conn.commit()
     finally:
         conn.close()

@@ -921,6 +921,258 @@ try:
           and "老评员" not in json.dumps(lrd, ensure_ascii=False)
           and "LEGACYCODE1" not in json.dumps(lrd), str(lrd))
 
+    # --- 2.10 负责人提前结束收集 ---
+    s, ec = req("POST", "/api/tests", {
+        "sample_a": "H-1", "sample_b": "H-2",
+        "panelists": [f"h{i}" for i in range(8)],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 4})
+    check("提前结束：创建 8 人测试", s == 200, str(ec))
+    ec_rows = con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (ec["test_code"],)).fetchall()
+    # 前 3 人答对，第 4 人弃权，其余未交
+    req("POST", f"/api/eval/{ec_rows[0]['code']}/submit",
+        {"answer": ec_rows[0]["odd_pos"]})
+    req("POST", f"/api/eval/{ec_rows[1]['code']}/submit",
+        {"answer": ec_rows[1]["odd_pos"]})
+    req("POST", f"/api/eval/{ec_rows[2]['code']}/submit",
+        {"answer": ec_rows[2]["odd_pos"]})
+    req("POST", f"/api/eval/{ec_rows[3]['code']}/submit", {"abstain": True})
+
+    # 原因校验：空（含纯空白）/ 超 200 字 → 422
+    st, er0 = req("POST", f"/api/tests/{ec['test_code']}/end",
+                  {"token": ec["token"], "reason": "   "})
+    check("提前结束：空白原因被拒 (422)", st == 422, str(er0))
+    st, erl = req("POST", f"/api/tests/{ec['test_code']}/end",
+                  {"token": ec["token"], "reason": "原" * 201})
+    check("提前结束：超 200 字原因被拒 (422)", st == 422, str(erl))
+    st, _ = req("POST", f"/api/tests/{ec['test_code']}/end",
+                {"token": ec["token"]})
+    check("提前结束：缺字段被拒 (422)", st == 422)
+    st, _ = req("POST", f"/api/tests/NOPE9999/end",
+                {"token": "x", "reason": "r"})
+    check("提前结束：不存在测试 404", st == 404)
+    st, _ = req("POST", f"/api/tests/{ec['test_code']}/end",
+                {"token": "wrong", "reason": "r"})
+    check("提前结束：错误令牌 403", st == 403)
+    # 校验失败不留结束痕迹
+    s, ec_prog0 = req("GET", f"/api/tests/{ec['test_code']}?token={ec['token']}")
+    check("提前结束：被拒后实验仍未结束",
+          ec_prog0["ended"] is False and ec_prog0["ended_at"] is None)
+
+    # 成功结束（原因两端带空白，服务端 trim；恰 200 字允许）
+    reason200 = "足" * 200
+    st, endr = req("POST", f"/api/tests/{ec['test_code']}/end",
+                   {"token": ec["token"], "reason": f"  {reason200}  "})
+    check("提前结束：200 字原因 200（trim 存储）",
+          st == 200 and endr["ok"] is True and endr["reused"] is False
+          and endr["ended"] is True and endr["end_reason"] == reason200
+          and endr["ended_at"] <= int(time.time() * 1000),
+          str(endr))
+
+    # 名单与答卷入口立即冻结
+    st, sub_denied = req("POST", f"/api/eval/{ec_rows[4]['code']}/submit",
+                         {"answer": 1})
+    check("提前结束后：未交评员提交被拒 (403)",
+          st == 403 and "结束" in sub_denied["detail"], str(sub_denied))
+    st, adj_denied = req("POST", f"/api/tests/{ec['test_code']}/adjust",
+                         {"token": ec["token"],
+                          "withdraw_codes": [ec_rows[4]["code"]]})
+    check("提前结束后：撤回被拒 (409)",
+          st == 409 and "结束" in adj_denied["detail"], str(adj_denied))
+    st, add_denied = req("POST", f"/api/tests/{ec['test_code']}/adjust",
+                         {"token": ec["token"], "add_panelists": ["hx"]})
+    check("提前结束后：补位被拒 (409)", st == 409, str(add_denied))
+    # 被冻结的未交码仍可访问（不是 withdrawn），但视图为已结束且不泄露分配
+    st, ev_ended = req("GET", f"/api/eval/{ec_rows[4]['code']}")
+    check("提前结束后：评员视图标记 ended、含原因",
+          st == 200 and ev_ended["ended"] is True
+          and ev_ended["ended_at"] == endr["ended_at"]
+          and ev_ended["end_reason"] == reason200
+          and ev_ended["submitted"] is False and ev_ended["settled"] is False,
+          str(ev_ended))
+    check("提前结束未结算前不泄露 odd_pos/odd_sample",
+          "odd_pos" not in ev_ended and "odd_sample" not in ev_ended
+          and "sample_a" not in ev_ended, str(ev_ended))
+    # 已交评员视图：submitted 优先，仍标记 ended
+    st, ev_done = req("GET", f"/api/eval/{ec_rows[0]['code']}")
+    check("提前结束后：已交评员保留已提交状态",
+          st == 200 and ev_done["submitted"] is True and ev_done["ended"] is True)
+
+    # 重复结束返回同一结束记录（reused=true，同一 ended_at），不产生第二条事件
+    st, endr2 = req("POST", f"/api/tests/{ec['test_code']}/end",
+                    {"token": ec["token"], "reason": "另一个原因也应幂等"})
+    check("提前结束：重复结束返回同一结束记录",
+          st == 200 and endr2["reused"] is True and endr2["ok"] is False
+          and endr2["ended_at"] == endr["ended_at"]
+          and endr2["end_reason"] == reason200, str(endr2))
+
+    # 结束后立即结算（截止时间仍在未来），规则不变：有效 3、弃权 1、未交 4、min=4
+    st, ecrep = req("POST", f"/api/tests/{ec['test_code']}/settle",
+                    {"token": ec["token"]})
+    check("提前结束后可立即结算 (200)", st == 200, str(ecrep))
+    check("提前结束结算：有效=3/答对=3/弃权=1/未交=4，样本不足不可辨",
+          ecrep["valid_count"] == 3 and ecrep["correct_count"] == 3
+          and ecrep["abstained_count"] == 1 and ecrep["missing_count"] == 4
+          and ecrep["distinguishable"] is False
+          and "样本不足" in ecrep["conclusion"], str(ecrep))
+    check("提前结束结算：p=(1/3)^3≈0.037",
+          abs(ecrep["p_value"] - 1 / 27) < 1e-9, str(ecrep["p_value"]))
+    check("提前结束结算：响应带结束信息",
+          ecrep["ended"] is True and ecrep["ended_at"] == endr["ended_at"]
+          and ecrep["end_reason"] == reason200, str(ecrep))
+    st, ecrep2 = req("POST", f"/api/tests/{ec['test_code']}/settle",
+                     {"token": ec["token"]})
+    check("提前结束后重复结算仍返回冻结结果",
+          st == 200 and ecrep2["settled_at"] == ecrep["settled_at"]
+          and ecrep2["valid_count"] == 3)
+    # 已结算（曾提前结束）后再结束：幂等返回同一结束记录
+    st, endr3 = req("POST", f"/api/tests/{ec['test_code']}/end",
+                    {"token": ec["token"], "reason": "r"})
+    check("提前结束：结算后重复结束仍返回同一结束记录",
+          st == 200 and endr3["reused"] is True
+          and endr3["ended_at"] == endr["ended_at"]
+          and endr3["settled"] is True, str(endr3))
+
+    # 时间线：create/answer×4/end/settle，end 事件记录原因与服务端时间
+    s, ectl = req("GET", f"/api/tests/{ec['test_code']}/timeline?token={ec['token']}")
+    etypes = [e["type"] for e in ectl["events"]]
+    check("提前结束：时间线类型序列含唯一 end（位于 answer 后、settle 前）",
+          etypes[0] == "create" and etypes.count("end") == 1
+          and etypes.count("answer") == 4
+          and etypes.index("end") > etypes.index("answer")
+          and etypes.index("end") < etypes.index("settle"),
+          str(etypes))
+    end_ev = [e for e in ectl["events"] if e["type"] == "end"][0]
+    check("提前结束：end 事件记录结束原因与服务端时间（ts=ended_at）",
+          end_ev["payload"]["reason"] == reason200
+          and end_ev["ts"] == endr["ended_at"]
+          and end_ev["payload"]["deadline"] == ec_prog0["deadline"],
+          str(end_ev))
+    settle_ev = [e for e in ectl["events"] if e["type"] == "settle"][0]
+    check("提前结束：结算事件标记 settled_after_end",
+          settle_ev["payload"].get("settled_after_end") is True,
+          str(settle_ev["payload"]))
+    check("提前结束：时间线响应含结束状态字段",
+          ectl["ended"] is True and ectl["ended_at"] == endr["ended_at"]
+          and ectl["end_reason"] == reason200)
+
+    # 已过截止（未提前结束）的实验不能再 end：建短截止测试等过点
+    s, ed = req("POST", "/api/tests", {
+        "sample_a": "HD-1", "sample_b": "HD-2",
+        "panelists": ["d1"],
+        "deadline": int(time.time() * 1000) + 1000, "min_valid": 1})
+    assert s == 200
+    time.sleep(1.6)
+    st, ede = req("POST", f"/api/tests/{ed['test_code']}/end",
+                  {"token": ed["token"], "reason": "晚了"})
+    check("提前结束：过截止后结束被拒 (409)，保持原截止行为",
+          st == 409 and "截止" in ede["detail"], str(ede))
+    st, edp = req("GET", f"/api/tests/{ed['test_code']}?token={ed['token']}")
+    check("提前结束：未结束实验保持原截止行为（ended=false）",
+          st == 200 and edp["ended"] is False and edp["ended_at"] is None)
+    # 截止后正常结算不受影响
+    st, _ = req("POST", f"/api/tests/{ed['test_code']}/settle",
+                {"token": ed["token"]})
+    check("提前结束：未结束实验到期后正常结算", st == 200)
+
+    # --- 2.11 并发：结束收集与答卷竞争，按先取得写锁者生效 ---
+    s, rc = req("POST", "/api/tests", {
+        "sample_a": "G-1", "sample_b": "G-2",
+        "panelists": [f"g{i}" for i in range(30)],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    rc_rows = con.execute(
+        "SELECT code FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (rc["test_code"],)).fetchall()
+
+    def end_submit_race(c):
+        result = {}
+        barrier = threading.Barrier(2)
+
+        def do_submit():
+            barrier.wait()
+            stt, body = req("POST", f"/api/eval/{c}/submit", {"answer": 1})
+            result["submit"] = (stt, body)
+
+        def do_end():
+            barrier.wait()
+            stt, body = req("POST", f"/api/tests/{rc['test_code']}/end",
+                            {"token": rc["token"], "reason": "并发结束原因"})
+            result["end"] = (stt, body)
+
+        t1 = threading.Thread(target=do_submit)
+        t2 = threading.Thread(target=do_end)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        return result
+
+    race2_ok = no_5xx2 = True
+    n_answer_win = n_end_win = 0
+    for i in range(10):
+        c = rc_rows[i]["code"]
+        r = end_submit_race(c)
+        sc, sbody = r["submit"]
+        ec_st, ebody = r["end"]
+        if ec_st >= 500 or sc >= 500:
+            no_5xx2 = False
+        row = con.execute(
+            "SELECT answer FROM assignments WHERE code=?", (c,)).fetchone()
+        # 结束先拿到写锁：end=200；该码答卷必为 403（已结束），且无答案
+        if ec_st == 200 and sc == 403 and "结束" in sbody["detail"]:
+            if row["answer"] is not None:
+                race2_ok = False
+            n_end_win += 1
+        # 答卷先拿到写锁：submit=200；结束看到已结束记录返回 200 reused（首码之后），
+        # 或首个码上 end=200 ok——无论如何答案必须落库，且全库仅有一条 end 事件
+        elif sc == 200 and ec_st == 200 and row["answer"] == 1:
+            n_answer_win += 1
+        else:
+            race2_ok = False
+
+    end_count = con.execute(
+        "SELECT COUNT(*) AS c FROM events WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) AND type='end'",
+        (rc["test_code"],)).fetchone()["c"]
+    tstate = con.execute(
+        "SELECT ended_at, end_reason FROM tests WHERE code=?",
+        (rc["test_code"],)).fetchone()
+    check("并发：结束与答卷结果互补、状态与胜出方一致，无脏中间态",
+          race2_ok and n_answer_win + n_end_win == 10 and end_count == 1
+          and tstate["ended_at"] is not None
+          and tstate["end_reason"] == "并发结束原因",
+          f"答卷先完成 {n_answer_win} 轮，结束先完成 {n_end_win} 轮")
+    check("并发：结束/答卷竞争过程中无 5xx", no_5xx2)
+
+    # 结束生效后，其余所有未交码提交一律 403（冻结彻底）
+    later_denied = all(
+        req("POST", f"/api/eval/{rc_rows[i]['code']}/submit", {"answer": 1})[0]
+        == 403
+        for i in range(10, 15))
+    check("并发：结束落库后后续答卷全部 403", later_denied)
+    # 时间线：end 事件之后不再有任何 answer 事件
+    s, rctl = req("GET", f"/api/tests/{rc['test_code']}/timeline?token={rc['token']}")
+    end_seq = [e["seq"] for e in rctl["events"] if e["type"] == "end"][0]
+    answers_after_end = [e for e in rctl["events"]
+                         if e["type"] == "answer" and e["seq"] > end_seq]
+    answer_wins_in_db = con.execute(
+        "SELECT COUNT(*) AS c FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) AND answer IS NOT NULL",
+        (rc["test_code"],)).fetchone()["c"]
+    check("并发：先于写锁完成的答卷数与 end 前 answer 事件数一致，end 后无答卷",
+          not answers_after_end
+          and sum(1 for e in rctl["events"] if e["type"] == "answer")
+              == answer_wins_in_db
+          and answer_wins_in_db == n_answer_win,
+          f"answer_wins={n_answer_win}, db_answers={answer_wins_in_db}")
+    # 结束后立即结算被允许，且只冻结先完成的答卷
+    st, rcrep = req("POST", f"/api/tests/{rc['test_code']}/settle",
+                    {"token": rc["token"]})
+    check("并发：结束后立即结算，冻结先完成的答卷",
+          st == 200 and rcrep["valid_count"] == n_answer_win
+          and rcrep["missing_count"] == 30 - n_answer_win, str(rcrep))
+
     # --- 2.6 页面可达性 ---
     for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):
         with urllib.request.urlopen(base + path, timeout=5) as r:

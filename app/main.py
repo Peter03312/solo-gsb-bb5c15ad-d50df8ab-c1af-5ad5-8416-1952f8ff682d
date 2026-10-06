@@ -1,12 +1,13 @@
 """三角嗅辨盲评工作台 —— FastAPI 后端。
 
 角色：
-- 实验负责人：创建测试、凭管理码 + 令牌查看进度、截止后结算并回看分配与答卷。
-- 评员：凭盲评码进入，截止前仅可见三杯并提交一次（异样杯位置或弃权）。
+- 实验负责人：创建测试、凭管理码 + 令牌查看进度、截止后结算并回看分配与答卷；
+  截止前可填写原因提前结束收集，立即冻结名单与答卷入口，结束后即可结算。
+- 评员：凭盲评码进入，截止前（且未被提前结束）仅可见三杯并提交一次（异样杯位置或弃权）。
 
 安全要点：
 - 评员接口任何时刻只返回“三杯随机展示”需要的信息；提交前不暴露 odd_pos/odd_sample。
-- 截止判定以服务端时间为准；答卷与结算在同一行锁语义下竞争截止线。
+- 截止判定以服务端时间为准；答卷、提前结束、名单调整与结算在同一行锁语义下竞争截止线。
 - 管理令牌以 sha256 哈希存储，请求使用恒定时间比较。
 """
 
@@ -30,6 +31,7 @@ ABSTAIN = -1
 ACTIVE = "active"
 WITHDRAWN = "withdrawn"
 MAX_PANELISTS = 500
+MAX_END_REASON_LEN = 200  # 负责人提前结束收集的原因长度：1～200 字
 MAX_SHARE_TTL_SECONDS = 7 * 24 * 3600  # 脱敏结果分享凭证最长有效期：7 天
 MAX_SHARE_NOTE_LEN = 200
 
@@ -161,7 +163,7 @@ def render_event(ev: dict, settled: bool, assign_by_code: dict) -> dict:
 
     盲态规则：settled 之前，answer 事件只呈现“已答 / 弃权”，
     不透露选杯、异样杯及对错；settled 之后才透出对应答案与判定。
-    create / adjust / settle / history_start 不含盲态答案，按原样呈现。
+    create / adjust / end / settle / history_start 不含盲态答案，按原样呈现。
     """
     payload = json.loads(ev["payload"] or "{}")
     item = {
@@ -248,6 +250,13 @@ class AdminAction(BaseModel):
     token: str
 
 
+class EndCollection(BaseModel):
+    """负责人截止前提前结束收集：必填 1～200 字原因（接口内 trim 归一化后校验）。"""
+    token: str
+    reason: str = Field(default="",
+                        description="提前结束原因（trim 后 1～200 字）")
+
+
 class SubmitAnswer(BaseModel):
     answer: Optional[int] = Field(default=None, ge=1, le=3)
     abstain: bool = False
@@ -291,7 +300,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.3", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.4", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -406,6 +415,9 @@ def get_test(test_code: str, token: str):
         "deadline": row["deadline"] * 1000,
         "now": ts * 1000,
         "min_valid": row["min_valid"],
+        "ended": row["ended_at"] is not None,
+        "ended_at": None if row["ended_at"] is None else row["ended_at"] * 1000,
+        "end_reason": row["end_reason"] if row["ended_at"] is not None else None,
         "settled": row["settled_at"] is not None,
         "withdrawn_count": withdrawn,
         "panelists": [a["panelist"] for a in assigns],
@@ -431,7 +443,8 @@ def get_assignment(code: str):
     conn = db.read_conn()
     try:
         a = conn.execute(
-            "SELECT a.*, t.deadline, t.settled_at, t.sample_a, t.sample_b "
+            "SELECT a.*, t.deadline, t.settled_at, t.ended_at, t.end_reason, "
+            "t.sample_a, t.sample_b "
             "FROM assignments a JOIN tests t ON a.test_id = t.id "
             "WHERE a.code = ? AND a.status = ?",
             (code, ACTIVE),
@@ -442,12 +455,16 @@ def get_assignment(code: str):
         raise HTTPException(status_code=404, detail="盲评码无效")
 
     ts = now_ts()
+    ended = a["ended_at"] is not None
     past_deadline = ts >= a["deadline"]
     data = {
         "panelist": a["panelist"],
         "deadline": a["deadline"] * 1000,
         "now": ts * 1000,
         "past_deadline": past_deadline,
+        "ended": ended,
+        "ended_at": None if a["ended_at"] is None else a["ended_at"] * 1000,
+        "end_reason": a["end_reason"] if ended else None,
         "settled": a["settled_at"] is not None,
         "submitted": a["answer"] is not None,
         "abstained": a["answer"] == ABSTAIN,
@@ -475,7 +492,7 @@ def submit(code: str, body: SubmitAnswer):
     with db.write_tx() as conn:
         ts = now_ts()
         a = conn.execute(
-            "SELECT a.*, t.deadline FROM assignments a "
+            "SELECT a.*, t.deadline, t.ended_at FROM assignments a "
             "JOIN tests t ON a.test_id = t.id "
             "WHERE a.code = ? AND a.status = ?",
             (code, ACTIVE),
@@ -484,6 +501,11 @@ def submit(code: str, body: SubmitAnswer):
             raise HTTPException(status_code=404, detail="盲评码无效")
         if a["answer"] is not None:
             raise HTTPException(status_code=409, detail="该盲评码已提交，答卷不可修改")
+        if a["ended_at"] is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="负责人已提前结束收集，答卷通道已关闭，答卷被拒绝",
+            )
         if ts >= a["deadline"]:
             raise HTTPException(status_code=403, detail="已过截止时间，答卷被拒绝")
 
@@ -504,7 +526,7 @@ def submit(code: str, body: SubmitAnswer):
 
 @app.post("/api/tests/{test_code}/settle")
 def settle(test_code: str, body: AdminAction):
-    """截止后结算；重复调用返回冻结结果。服务端时间为唯一截止依据。"""
+    """到期或提前结束后结算；重复调用返回冻结结果。服务端时间为唯一截止依据。"""
     with db.write_tx() as conn:
         row = conn.execute(
             "SELECT * FROM tests WHERE code = ?", (test_code,)
@@ -514,8 +536,9 @@ def settle(test_code: str, body: AdminAction):
         verify_admin(row, body.token)
 
         ts = now_ts()
-        if ts < row["deadline"]:
-            raise HTTPException(status_code=409, detail="尚未到截止时间，不能结算")
+        if ts < row["deadline"] and row["ended_at"] is None:
+            raise HTTPException(status_code=409,
+                                detail="尚未到截止时间且未提前结束，不能结算")
 
         if row["settled_at"] is not None:
             frozen = row
@@ -538,8 +561,8 @@ def settle(test_code: str, body: AdminAction):
                    p_value=?, distinguishable=? WHERE id=?""",
                 (ts, valid, correct, p, distinguishable, row["id"]),
             )
-            # 结算事件与状态冻结同一事务提交
-            db.log_event(conn, row["id"], ts, "settle", {
+            # 结算事件与状态冻结同一事务提交；提前结束后立即结算时记录结束来源
+            settle_payload = {
                 "valid_count": valid,
                 "correct_count": correct,
                 "abstained_count": abstained,
@@ -547,7 +570,10 @@ def settle(test_code: str, body: AdminAction):
                 "p_value": p,
                 "min_valid": row["min_valid"],
                 "distinguishable": bool(distinguishable),
-            })
+            }
+            if row["ended_at"] is not None:
+                settle_payload["settled_after_end"] = True
+            db.log_event(conn, row["id"], ts, "settle", settle_payload)
             frozen = conn.execute(
                 "SELECT * FROM tests WHERE id = ?", (row["id"],)
             ).fetchone()
@@ -563,6 +589,9 @@ def settle(test_code: str, body: AdminAction):
         "sample_a": frozen["sample_a"],
         "sample_b": frozen["sample_b"],
         "deadline": frozen["deadline"] * 1000,
+        "ended": frozen["ended_at"] is not None,
+        "ended_at": None if frozen["ended_at"] is None else frozen["ended_at"] * 1000,
+        "end_reason": frozen["end_reason"] if frozen["ended_at"] is not None else None,
         "settled_at": frozen["settled_at"] * 1000,
         "valid_count": frozen["valid_count"],
         "correct_count": frozen["correct_count"],
@@ -573,6 +602,75 @@ def settle(test_code: str, body: AdminAction):
         "distinguishable": bool(frozen["distinguishable"]),
         "conclusion": settlement_conclusion(frozen),
         "assignments": [assignment_detail(a) for a in assigns],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 提前结束收集
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tests/{test_code}/end")
+def end_collection(test_code: str, body: EndCollection):
+    """负责人截止前提前结束收集：立即冻结名单与答卷入口。
+
+    - 凭管理凭证；原因 trim 后须为 1～200 字。
+    - 仅未提前结束、未结算且未过截止时间的实验可结束；
+      已提前结束的重复调用返回同一结束记录（reused=true，不新增事件）。
+    - 结束后：评员再访问 / 提交一律按已结束拒绝；撤回 / 补位被拒；
+      结算可立即执行（仍按现有有效答卷、最少数和 p 值规则冻结结果）。
+    - 与并发答卷按“先取得写锁者”生效：答卷事务先提交则该答卷计入，
+      结束事务先提交则并发答卷在锁内复查到 ended_at 而被拒。
+    - 结束事件与状态冻结在同一写事务提交，时间线记录结束原因与服务端时间。
+    """
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="结束原因不能为空")
+    if len(reason) > MAX_END_REASON_LEN:
+        raise HTTPException(status_code=422,
+                            detail=f"结束原因长度不得超过 {MAX_END_REASON_LEN} 字")
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        reused = False
+        if row["ended_at"] is not None:
+            # 幂等：重复结束返回同一结束记录
+            ended_at, stored_reason = row["ended_at"], row["end_reason"]
+            reused = True
+        else:
+            if row["settled_at"] is not None:
+                raise HTTPException(status_code=409,
+                                    detail="测试已结算，无需结束收集")
+            ts = now_ts()
+            if ts >= row["deadline"]:
+                raise HTTPException(status_code=409,
+                                    detail="已过截止时间，收集已按原截止自动关闭，"
+                                           "无需提前结束")
+            conn.execute(
+                "UPDATE tests SET ended_at=?, end_reason=? WHERE id=?",
+                (ts, reason, row["id"]),
+            )
+            # 结束事件与冻结状态同一事务；原因与服务端时间进入时间线
+            db.log_event(conn, row["id"], ts, "end", {
+                "reason": reason,
+                "deadline": row["deadline"] * 1000,
+            })
+            ended_at, stored_reason = ts, reason
+
+    return {
+        "ok": not reused,
+        "reused": reused,
+        "test_code": test_code,
+        "ended": True,
+        "ended_at": ended_at * 1000,
+        "end_reason": stored_reason,
+        "deadline": row["deadline"] * 1000,
+        "settled": row["settled_at"] is not None,
     }
 
 
@@ -589,7 +687,7 @@ def adjust_roster(test_code: str, body: AdjustRoster):
     - 补位取得新专属码；同一实验姓名（含已撤回者）不得重用。
     - 已有评员的杯序、异样样本和答卷不变；新分配在当前有效名单上贪心均衡。
     - 调整后有效人数须满足 min_valid ≤ 人数 ≤ 500。
-    - 截止或结算后拒绝；任一校验失败整个操作回滚。
+    - 截止、提前结束或结算后拒绝；任一校验失败整个操作回滚。
     - 与答卷并发时，以实际先拿到写锁并完成的操作为准。
     """
     withdraw_codes = [c.strip() for c in body.withdraw_codes if c and c.strip()]
@@ -621,6 +719,9 @@ def adjust_roster(test_code: str, body: AdjustRoster):
         if row["settled_at"] is not None:
             raise HTTPException(status_code=409,
                                 detail="测试已结算，名单已冻结，不能调整")
+        if row["ended_at"] is not None:
+            raise HTTPException(status_code=409,
+                                detail="收集已被负责人提前结束，名单已冻结，不能调整")
         if now_ts() >= row["deadline"]:
             raise HTTPException(status_code=409,
                                 detail="已过截止时间，不能调整名单")
@@ -791,6 +892,9 @@ def timeline(test_code: str, token: str):
     return {
         "test_code": row["code"],
         "settled": settled,
+        "ended": row["ended_at"] is not None,
+        "ended_at": None if row["ended_at"] is None else row["ended_at"] * 1000,
+        "end_reason": row["end_reason"] if row["ended_at"] is not None else None,
         "now": now_ts() * 1000,
         # 存在 history_start 标记表示该测试既往操作无法追溯（旧库升级）
         "history_complete": all(e["type"] != "history_start" for e in events),
