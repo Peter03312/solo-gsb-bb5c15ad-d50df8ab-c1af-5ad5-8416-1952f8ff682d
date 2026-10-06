@@ -65,6 +65,7 @@ function render(a) {
   const srvOffset = a.now - Date.now();  // 倒计时以服务端时钟为准
   const remain = a.deadline - (Date.now() + srvOffset);
   if (a.submitted) { renderDone(a); return; }
+  if (a.closed) { renderEnded(a); return; }
   if (a.past_deadline) { renderClosed(a); return; }
 
   appEl.innerHTML = `
@@ -124,8 +125,21 @@ async function submit(abstain) {
   } catch (err) {
     showErr(msgEl, err.message);
     btns.forEach(id => { const b = document.getElementById(id); if (b) b.disabled = false; });
-    if (/截止|已提交/.test(err.message)) loadAssignment();
+    if (/截止|已提交|结束/.test(err.message)) loadAssignment();
   }
+}
+
+function renderEnded(a) {
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>评员：${esc(a.panelist)}</h2>
+      <div class="callout no">
+        收集已由负责人提前结束（${fmtTime(a.closed_at)}），答卷通道已关闭，
+        系统不再接收任何提交。
+        ${a.close_reason ? `<br>结束原因：<b>${esc(a.close_reason)}</b>` : ''}
+      </div>
+      ${a.settled ? revealHtml(a) : '<p class="hint">负责人结算后，可在本页回看结果。</p>'}
+    </div>`;
 }
 
 function renderClosed(a) {

@@ -7,6 +7,8 @@
 安全要点：
 - 评员接口任何时刻只返回“三杯随机展示”需要的信息；提交前不暴露 odd_pos/odd_sample。
 - 截止判定以服务端时间为准；答卷与结算在同一行锁语义下竞争截止线。
+- 负责人可在截止前提前结束收集：结束后立即冻结名单与答卷入口，
+  结束操作与并发答卷按先取得写锁者生效，重复结束返回同一结束记录。
 - 管理令牌以 sha256 哈希存储，请求使用恒定时间比较。
 """
 
@@ -32,6 +34,7 @@ WITHDRAWN = "withdrawn"
 MAX_PANELISTS = 500
 MAX_SHARE_TTL_SECONDS = 7 * 24 * 3600  # 脱敏结果分享凭证最长有效期：7 天
 MAX_SHARE_NOTE_LEN = 200
+MAX_CLOSE_REASON_LEN = 200  # 提前结束收集的原因长度上限（字）
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +164,7 @@ def render_event(ev: dict, settled: bool, assign_by_code: dict) -> dict:
 
     盲态规则：settled 之前，answer 事件只呈现“已答 / 弃权”，
     不透露选杯、异样杯及对错；settled 之后才透出对应答案与判定。
-    create / adjust / settle / history_start 不含盲态答案，按原样呈现。
+    create / adjust / settle / close / history_start 不含盲态答案，按原样呈现。
     """
     payload = json.loads(ev["payload"] or "{}")
     item = {
@@ -281,6 +284,15 @@ class ShareRevoke(BaseModel):
     token: str
 
 
+class CloseTest(BaseModel):
+    """负责人截止前提前结束收集：必须填写 1~200 字结束原因。"""
+    token: str
+    reason: str = Field(
+        min_length=1, max_length=MAX_CLOSE_REASON_LEN,
+        description="结束原因（trim 后 1~200 字，记入操作时间线）",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -291,7 +303,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.3", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.4", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -407,6 +419,10 @@ def get_test(test_code: str, token: str):
         "now": ts * 1000,
         "min_valid": row["min_valid"],
         "settled": row["settled_at"] is not None,
+        # 提前结束收集状态（纯增量字段）：结束后名单与答卷入口已冻结
+        "closed": row["closed_at"] is not None,
+        "closed_at": None if row["closed_at"] is None else row["closed_at"] * 1000,
+        "close_reason": row["close_reason"],
         "withdrawn_count": withdrawn,
         "panelists": [a["panelist"] for a in assigns],
         "codes": [  # 仅负责人可见，用于向评员分发专属盲评链接
@@ -431,7 +447,8 @@ def get_assignment(code: str):
     conn = db.read_conn()
     try:
         a = conn.execute(
-            "SELECT a.*, t.deadline, t.settled_at, t.sample_a, t.sample_b "
+            "SELECT a.*, t.deadline, t.settled_at, t.sample_a, t.sample_b, "
+            "t.closed_at, t.close_reason "
             "FROM assignments a JOIN tests t ON a.test_id = t.id "
             "WHERE a.code = ? AND a.status = ?",
             (code, ACTIVE),
@@ -449,6 +466,10 @@ def get_assignment(code: str):
         "now": ts * 1000,
         "past_deadline": past_deadline,
         "settled": a["settled_at"] is not None,
+        # 提前结束：评员再访问返回已结束（含原因），答卷入口已关闭
+        "closed": a["closed_at"] is not None,
+        "closed_at": None if a["closed_at"] is None else a["closed_at"] * 1000,
+        "close_reason": a["close_reason"],
         "submitted": a["answer"] is not None,
         "abstained": a["answer"] == ABSTAIN,
         "answer": (
@@ -475,7 +496,7 @@ def submit(code: str, body: SubmitAnswer):
     with db.write_tx() as conn:
         ts = now_ts()
         a = conn.execute(
-            "SELECT a.*, t.deadline FROM assignments a "
+            "SELECT a.*, t.deadline, t.closed_at FROM assignments a "
             "JOIN tests t ON a.test_id = t.id "
             "WHERE a.code = ? AND a.status = ?",
             (code, ACTIVE),
@@ -484,6 +505,9 @@ def submit(code: str, body: SubmitAnswer):
             raise HTTPException(status_code=404, detail="盲评码无效")
         if a["answer"] is not None:
             raise HTTPException(status_code=409, detail="该盲评码已提交，答卷不可修改")
+        if a["closed_at"] is not None:
+            raise HTTPException(status_code=403,
+                                detail="收集已由负责人提前结束，答卷被拒绝")
         if ts >= a["deadline"]:
             raise HTTPException(status_code=403, detail="已过截止时间，答卷被拒绝")
 
@@ -504,7 +528,7 @@ def submit(code: str, body: SubmitAnswer):
 
 @app.post("/api/tests/{test_code}/settle")
 def settle(test_code: str, body: AdminAction):
-    """截止后结算；重复调用返回冻结结果。服务端时间为唯一截止依据。"""
+    """截止后（或提前结束后）结算；重复调用返回冻结结果。服务端时间为唯一截止依据。"""
     with db.write_tx() as conn:
         row = conn.execute(
             "SELECT * FROM tests WHERE code = ?", (test_code,)
@@ -514,7 +538,8 @@ def settle(test_code: str, body: AdminAction):
         verify_admin(row, body.token)
 
         ts = now_ts()
-        if ts < row["deadline"]:
+        # 提前结束的收集可立即结算；未结束的实验保持原截止行为
+        if ts < row["deadline"] and row["closed_at"] is None:
             raise HTTPException(status_code=409, detail="尚未到截止时间，不能结算")
 
         if row["settled_at"] is not None:
@@ -577,6 +602,71 @@ def settle(test_code: str, body: AdminAction):
 
 
 # ---------------------------------------------------------------------------
+# 提前结束收集（负责人，截止前）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tests/{test_code}/close")
+def close_test(test_code: str, body: CloseTest):
+    """负责人在截止前提前结束收集：立即冻结名单与答卷入口。
+
+    - 必须填写 1~200 字结束原因（trim 后非空），原因与服务端时间记入操作时间线。
+    - 成功后评员再访问或提交返回「已结束」（提交 403），撤回/补位一律拒绝（409）。
+    - 与并发答卷在同一 BEGIN IMMEDIATE 写锁语义下竞争：先取得写锁者生效——
+      答卷先完成则该答卷有效，结束先完成则答卷按「已结束」拒绝。
+    - 幂等：重复结束返回同一结束记录（reused=true，原原因与结束时间不变），
+      不重复写时间线。
+    - 结束后可立即结算，结算仍按现有有效答卷、最少有效数与 p 值规则冻结结果；
+      未结束的实验保持原截止行为。
+    """
+    reason = (body.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422,
+                            detail="结束原因不能为空（1~200 字）")
+    if len(reason) > MAX_CLOSE_REASON_LEN:
+        raise HTTPException(status_code=422,
+                            detail=f"结束原因不得超过 {MAX_CLOSE_REASON_LEN} 字")
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        if row["closed_at"] is not None:
+            # 幂等：重复结束返回同一结束记录，不追加事件、不改动原记录
+            reused = True
+        else:
+            if row["settled_at"] is not None:
+                raise HTTPException(status_code=409,
+                                    detail="测试已结算，收集已冻结，不能再结束")
+            ts = now_ts()
+            if ts >= row["deadline"]:
+                raise HTTPException(status_code=409,
+                                    detail="已过截止时间，收集已自动截止，无需结束")
+            conn.execute(
+                "UPDATE tests SET closed_at=?, close_reason=? WHERE id=?",
+                (ts, reason, row["id"]),
+            )
+            # 结束事件与状态冻结同一事务提交；记录原因与服务端时间
+            db.log_event(conn, row["id"], ts, "close", {"reason": reason})
+            row = conn.execute(
+                "SELECT * FROM tests WHERE id = ?", (row["id"],)
+            ).fetchone()
+            reused = False
+
+    return {
+        "ok": True,
+        "test_code": row["code"],
+        "closed": True,
+        "closed_at": row["closed_at"] * 1000,
+        "close_reason": row["close_reason"],
+        "reused": reused,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 名单调整（撤回 / 补位）
 # ---------------------------------------------------------------------------
 
@@ -589,7 +679,7 @@ def adjust_roster(test_code: str, body: AdjustRoster):
     - 补位取得新专属码；同一实验姓名（含已撤回者）不得重用。
     - 已有评员的杯序、异样样本和答卷不变；新分配在当前有效名单上贪心均衡。
     - 调整后有效人数须满足 min_valid ≤ 人数 ≤ 500。
-    - 截止或结算后拒绝；任一校验失败整个操作回滚。
+    - 截止、提前结束或结算后拒绝；任一校验失败整个操作回滚。
     - 与答卷并发时，以实际先拿到写锁并完成的操作为准。
     """
     withdraw_codes = [c.strip() for c in body.withdraw_codes if c and c.strip()]
@@ -621,6 +711,9 @@ def adjust_roster(test_code: str, body: AdjustRoster):
         if row["settled_at"] is not None:
             raise HTTPException(status_code=409,
                                 detail="测试已结算，名单已冻结，不能调整")
+        if row["closed_at"] is not None:
+            raise HTTPException(status_code=409,
+                                detail="收集已由负责人提前结束，名单已冻结，不能调整")
         if now_ts() >= row["deadline"]:
             raise HTTPException(status_code=409,
                                 detail="已过截止时间，不能调整名单")
@@ -791,6 +884,9 @@ def timeline(test_code: str, token: str):
     return {
         "test_code": row["code"],
         "settled": settled,
+        # 提前结束状态（纯增量字段）；close 事件本身含原因与服务端时间
+        "closed": row["closed_at"] is not None,
+        "closed_at": None if row["closed_at"] is None else row["closed_at"] * 1000,
         "now": now_ts() * 1000,
         # 存在 history_start 标记表示该测试既往操作无法追溯（旧库升级）
         "history_complete": all(e["type"] != "history_start" for e in events),
